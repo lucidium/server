@@ -56,6 +56,7 @@ from music_assistant.helpers.ffmpeg import (
     get_ffmpeg_stream,
     probe_audio_stream,
 )
+from music_assistant.helpers.playback_trace import trace_event
 from music_assistant.helpers.throttle_retry import (
     RequestPriority,
     request_priority,
@@ -564,6 +565,15 @@ class AudioBuffer:
                     # stream slot) lands here on an abort of our own making
                     producer = self._producer_task
                     releasing = self.cancelled or bool(producer and producer.cancelling())
+                    trace_event(
+                        "buffer.timeout",
+                        buffer_id=id(self),
+                        queue_id=streamdetails.queue_id,
+                        provider=streamdetails.provider,
+                        buffered_seconds=self.seconds_available,
+                        releasing=releasing,
+                        duration_ms=round((time.monotonic() - self._fill_started) * 1000, 1),
+                    )
                     if not releasing:
                         LOGGER.warning(
                             "%s: Gave up on %s (%s) after %.2fs, %ss buffered",
@@ -659,6 +669,12 @@ class AudioBuffer:
         # a source that failed or ended empty also lands here, without the
         # buffer ever having become playable
         if self._chunks and not self.has_error:
+            trace_event(
+                "buffer.ready",
+                buffer_id=id(self),
+                duration_ms=round((time.monotonic() - self._fill_started) * 1000, 1),
+                buffered_seconds=self.seconds_available,
+            )
             LOGGER.debug(
                 "AudioBuffer: %s became ready after %.2fs",
                 self._source_name,
@@ -936,6 +952,17 @@ def _new_buffer(
         mode,
         ready_threshold=ready_threshold,
         is_realtime=streamdetails.is_realtime,
+    )
+    trace_event(
+        "buffer.created",
+        buffer_id=id(audio_buffer),
+        queue_id=streamdetails.queue_id,
+        provider=streamdetails.provider,
+        ready_seconds=ready_threshold,
+        crossfade=crossfade_enabled,
+        normalization=streamdetails.volume_normalization_mode,
+        seek_ms=seek_position_ms,
+        realtime=streamdetails.is_realtime,
     )
     audio_buffer.max_size_seconds = max_size
     # align chunk numbering with the actual stream start position so that

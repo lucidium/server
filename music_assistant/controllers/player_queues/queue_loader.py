@@ -11,6 +11,7 @@ it is mixed into the controller and reads/mutates the controller's `PlayerQueueD
 from __future__ import annotations
 
 import random
+import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, cast
 
@@ -76,6 +77,7 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
     set_impersonated_user,
 )
 from music_assistant.helpers.audio import get_probed_duration, store_probed_duration
+from music_assistant.helpers.playback_trace import trace_event, trace_stage
 from music_assistant.helpers.provider_access import playback_sources, resolve_playback_user
 from music_assistant.helpers.throttle_retry import (
     RequestPriority,
@@ -330,7 +332,15 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         :param seek_position: Position (in seconds) to start playback from.
         :param fade_in: Whether to fade in the audio.
         """
+        load_started = time.monotonic()
         queue_id = queue_item.queue_id
+        trace_event(
+            "queue.load.start",
+            queue_id=queue_id,
+            item_id=queue_item.queue_item_id,
+            seek_seconds=seek_position,
+            is_start=is_start,
+        )
         queue = self._queue_data[queue_id].queue
 
         self.logger.debug(
@@ -381,9 +391,15 @@ class QueueLoaderMixin(_PlayerQueuesBase):
                 queue_item.media_item.album = album
         if is_start:
             # a track skip should hand its source slot to the item the user is starting
-            await self._abort_superseded_source_buffers(
-                queue_item, seek_position_ms=int(seek_position * 1000)
-            )
+            with trace_stage("queue.release_previous", item_id=queue_item.queue_item_id):
+                await self._abort_superseded_source_buffers(
+                    queue_item, seek_position_ms=int(seek_position * 1000)
+                )
+        trace_event(
+            "queue.metadata_ready",
+            item_id=queue_item.queue_item_id,
+            duration_ms=round((time.monotonic() - load_started) * 1000, 1),
+        )
 
         # Fetch streamdetails (reuses existing if buffer is still valid for the seek).
         queue_item.streamdetails = await self.mass.streams.audio.get_stream_details(
@@ -391,6 +407,14 @@ class QueueLoaderMixin(_PlayerQueuesBase):
             seek_position=seek_position,
             fade_in=fade_in,
             prefer_album_loudness=self._plays_as_album_track(queue_item),
+        )
+        trace_event(
+            "queue.stream_details",
+            queue_id=queue_id,
+            item_id=queue_item.queue_item_id,
+            provider=queue_item.streamdetails.provider,
+            stream_type=queue_item.streamdetails.stream_type.value,
+            duration_ms=round((time.monotonic() - load_started) * 1000, 1),
         )
         if (origin := queue_item.origin) is not None:
             self.logger.debug(
@@ -424,6 +448,12 @@ class QueueLoaderMixin(_PlayerQueuesBase):
                 queue_item,
                 seek_position_ms=int(seek_position * 1000),
                 reason="prepare",
+            )
+            trace_event(
+                "queue.buffer_ready",
+                queue_id=queue_id,
+                item_id=queue_item.queue_item_id,
+                duration_ms=round((time.monotonic() - load_started) * 1000, 1),
             )
             # the first chunk is in, so the source has been probed and a duration the
             # provider did not report is known before playback starts

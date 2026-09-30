@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+
+# The build context contains only source files verified against the deployed image.
+ARG BASE_IMAGE=ma-server:local
+FROM ${BASE_IMAGE}
+
+ARG BUILD_COMMIT
+ARG TRACE_DIGEST
+LABEL org.opencontainers.image.revision="${BUILD_COMMIT}+playback-trace-${TRACE_DIGEST}"
+
+COPY music_assistant/ /app/venv/lib/python3.14/site-packages/music_assistant/
+RUN /app/venv/bin/python -m compileall -q /app/venv/lib/python3.14/site-packages/music_assistant
+
+ENV MA_PLAYBACK_TRACE=1

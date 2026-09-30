@@ -15,6 +15,10 @@ from music_assistant.constants import (
 from music_assistant.helpers.ffmpeg import get_ffmpeg_readrate_catchup_args
 from music_assistant.helpers.util import get_total_system_memory, meets_memory_target
 
+PULL_SOURCE_DOMAINS: Final[frozenset[str]] = frozenset(
+    {"filesystem_local", "apple_music", "deezer", "tidal", "qobuz", "soundcloud", "yandex_music"}
+)
+
 # What the volume normalization preference falls back to.
 DEFAULT_VOLUME_NORMALIZATION_MODE: Final = VolumeNormalizationMode.FALLBACK_DYNAMIC
 

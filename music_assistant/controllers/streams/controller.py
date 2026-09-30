@@ -8,8 +8,12 @@ purely to stream audio packets to players.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
+import secrets
+import time
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, suppress
 from dataclasses import dataclass
@@ -98,6 +102,7 @@ from music_assistant.controllers.streams.constants import (
     FLOW_STREAM_LEAD_OUT_SECONDS,
     ICY_WRITE_SIZE,
     OUTCOME_ONLY_NORMALIZATION_MODES,
+    PULL_SOURCE_DOMAINS,
     BufferSize,
     PacingProfile,
     get_available_buffer_sizes,
@@ -124,6 +129,7 @@ from music_assistant.helpers.ffmpeg import (
     get_ffmpeg_stream,
 )
 from music_assistant.helpers.ffmpeg import LOGGER as FFMPEG_LOGGER
+from music_assistant.helpers.playback_trace import trace_event
 from music_assistant.helpers.throttle_retry import (
     RequestPriority,
     request_priority,
@@ -272,6 +278,7 @@ class StreamsController(CoreController):
         self.live_announcements = LiveAnnouncementManager(mass, self.logger)
         self._bind_ip: str = "0.0.0.0"  # noqa: S104 - listen on all interfaces by default
         self._base_url: str = ""
+        self._pull_signing_key = secrets.token_bytes(32)
         self._configured_publish_ip: str | None = None
         # every address players may reach this host on, best candidate first; publish_ip is
         # the first of them and the network fingerprint watches the whole list for changes
@@ -608,6 +615,7 @@ class StreamsController(CoreController):
         """Async initialize of module."""
         # initialize the audio sub-controller (needs mass.streams to be set)
         self.audio.setup()
+        trace_event("enabled", version=1)
         self._audio_analysis.setup()
         self._setup_derived_loggers(config)
         # perform check for ffmpeg version
@@ -645,6 +653,11 @@ class StreamsController(CoreController):
                 (
                     "*",
                     "/single/{session_id}/{queue_id}/{queue_item_id}/{player_id}.{fmt}",
+                    self.serve_queue_item_stream,
+                ),
+                (
+                    "GET",
+                    "/streamserver/pull/single/{session_id}/{queue_id}/{queue_item_id}/{player_id}.{fmt}",
                     self.serve_queue_item_stream,
                 ),
                 (
@@ -799,6 +812,19 @@ class StreamsController(CoreController):
             f"{self.base_url}/{base_path}/{session_id}/{queue_id}/{queue_item_id}/{player_id}.{fmt}"
         )
 
+    def resolve_pull_stream_url(self, player_id: str, media: PlayerMedia) -> tuple[str, str]:
+        """Issue a single-item FLAC URL and a short-lived, item-scoped token."""
+        session_id = media.queue_session_id
+        queue_id = media.source_id
+        item_id = media.queue_item_id
+        if not session_id or not queue_id or not item_id:
+            raise InvalidDataError("Pull playback requires a queue item and session")
+        expiry = int(time.time()) + 4 * 3600
+        signature = self._sign_pull_request(session_id, queue_id, item_id, player_id, expiry)
+        base_url = os.environ.get("MA_PULL_PUBLIC_BASE_URL", self.base_url).rstrip("/")
+        url = f"{base_url}/single/{session_id}/{queue_id}/{item_id}/{player_id}.flac"
+        return url, f"{expiry}.{signature}"
+
     def close_superseded_item_streams(self, queue_id: str, current_session_id: str | None) -> None:
         """
         Abort open per-item responses of sessions the queue has moved past.
@@ -817,6 +843,7 @@ class StreamsController(CoreController):
 
     async def serve_queue_item_stream(self, request: web.Request) -> web.StreamResponse:  # noqa: C901, PLR0912, PLR0915
         """Stream single queueitem audio to a player."""
+        request_started = time.monotonic()
         self._log_request(request)
         # what a stream request asks of a provider is playback
         set_request_priority(RequestPriority.HIGH)
@@ -846,6 +873,34 @@ class StreamsController(CoreController):
         queue_item_id = queue_item.queue_item_id
         # the sweeps over open requests read the item from here, however the URL named it
         request[_REQUEST_QUEUE_ITEM_ID] = queue_item_id
+        # a mocked controller or request (unit tests) must never look like a pull request
+        pull_request = self._valid_pull_request(request) is True
+        request_path = request.path
+        if (
+            isinstance(request_path, str)
+            and request_path.startswith("/streamserver/pull/")
+            and not pull_request
+        ):
+            raise web.HTTPForbidden(reason="Pull token required")
+        if pull_request:
+            details = queue_item.streamdetails
+            provider = self.mass.get_provider(details.provider) if details else None
+            if (
+                request.method != "GET"
+                or request.match_info["fmt"] != "flac"
+                or details is None
+                or details.is_realtime
+                or provider is None
+                or provider.domain not in PULL_SOURCE_DOMAINS
+            ):
+                raise web.HTTPForbidden(reason="Pull playback is unavailable for this source")
+        trace_event(
+            "stream.request",
+            queue_id=queue_id,
+            item_id=queue_item_id,
+            player_id=player_id,
+            pull=pull_request,
+        )
 
         is_audio_source = (
             queue_item.media_item is not None
@@ -1150,7 +1205,7 @@ class StreamsController(CoreController):
                     input_format=pcm_format,
                     output_format=output_format,
                     filter_params=filter_params,
-                    extra_input_args=output_pacing_args(pacing),
+                    extra_input_args=[] if pull_request else output_pacing_args(pacing),
                 )
             first_chunk_received = False
             bytes_sent = 0
@@ -1180,6 +1235,17 @@ class StreamsController(CoreController):
                             bytes_sent += len(chunk)
                             if not first_chunk_received:
                                 first_chunk_received = True
+                                trace_event(
+                                    "stream.first_bytes",
+                                    queue_id=queue_id,
+                                    item_id=queue_item_id,
+                                    player_id=player_id,
+                                    duration_ms=round(
+                                        (time.monotonic() - request_started) * 1000, 1
+                                    ),
+                                    chunk_bytes=len(chunk),
+                                    pull=pull_request,
+                                )
                                 # inform the queue that the track is now loaded in the buffer
                                 # so for example the next track can be enqueued
                                 self.mass.player_queues.track_loaded_in_buffer(
@@ -2675,6 +2741,37 @@ class StreamsController(CoreController):
         # the single address players are handed, taken from the top of the ranked list
         self.publish_ip = self._publish_addresses[0]
         self._base_url = f"http://{format_ip_for_url(self.publish_ip)}:{self.publish_port}"
+
+    def _sign_pull_request(
+        self, session_id: str, queue_id: str, item_id: str, player_id: str, expiry: int
+    ) -> str:
+        data = "\0".join((session_id, queue_id, item_id, player_id, str(expiry)))
+        return hmac.new(self._pull_signing_key, data.encode(), hashlib.sha256).hexdigest()
+
+    def _valid_pull_request(self, request: web.Request) -> bool:
+        token = request.headers.get("X-MA-Pull-Token")
+        # a mocked or malformed request (tests) carries no usable token - not a pull request
+        if not isinstance(token, str) or not token:
+            return False
+        expiry_text, separator, signature = token.partition(".")
+        if not separator:
+            raise web.HTTPForbidden(reason="Invalid pull token")
+        try:
+            expiry = int(expiry_text)
+        except ValueError:
+            raise web.HTTPForbidden(reason="Invalid pull token") from None
+        if expiry < time.time() or expiry > time.time() + 4 * 3600 or not signature:
+            raise web.HTTPForbidden(reason="Expired pull token")
+        expected = self._sign_pull_request(
+            request.match_info["session_id"],
+            request.match_info["queue_id"],
+            request.match_info["queue_item_id"],
+            request.match_info["player_id"],
+            expiry,
+        )
+        if not hmac.compare_digest(signature, expected):
+            raise web.HTTPForbidden(reason="Invalid pull token")
+        return True
 
     async def _handle_info_request(self, request: web.Request) -> web.Response:
         """Answer a reachability probe with this server's id."""

@@ -23,6 +23,7 @@ from music_assistant.constants import MASS_USER_AGENT
 
 from . import ssl as ssl_util
 from .json import json_dumps, json_loads
+from .playback_trace import TRACE_ENABLED, create_playback_http_trace
 
 if TYPE_CHECKING:
     from aiohttp.typedefs import JSONDecoder
@@ -52,6 +53,8 @@ def create_clientsession(
     **kwargs: Any,
 ) -> aiohttp.ClientSession:
     """Create a new ClientSession with kwargs, i.e. for cookies."""
+    if TRACE_ENABLED:
+        kwargs["trace_configs"] = [*kwargs.get("trace_configs", []), create_playback_http_trace()]
     clientsession = aiohttp.ClientSession(
         connector=_get_connector(mass, verify_ssl, socks_url),
         # honour the (NO_|HTTP_|HTTPS_)PROXY env vars, unless an explicit socks proxy is set;

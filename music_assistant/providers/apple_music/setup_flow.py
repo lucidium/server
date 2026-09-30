@@ -161,6 +161,7 @@ async def _musickit_authenticate(session: SetupSession, app_token: str) -> dict[
     :param app_token: The (validated) developer token the MusicKit page configures with.
     """
     mass = session.mass
+    auth_base_url = mass.webserver.external_url or mass.webserver.base_url
     asset_dir = pathlib.Path(__file__).parent.joinpath("musickit_auth")
     prefill = session.context.setup_data
     prefill_token = prefill.get(CONF_MUSIC_USER_TOKEN)
@@ -186,7 +187,7 @@ async def _musickit_authenticate(session: SetupSession, app_token: str) -> dict[
 
     async def serve_mk_glue(request: web.Request) -> web.Response:  # noqa: ARG001
         glue = f"""
-        const return_url={_js_str(session.callback_url)};
+        const return_url={_js_str(f"{auth_base_url}{session.callback_path}")};
         const app_token={_js_str(app_token)};
         const callback_method='POST';
         const user_token={_js_str(user_token)};
@@ -204,7 +205,7 @@ async def _musickit_authenticate(session: SetupSession, app_token: str) -> dict[
     ]
     try:
         return await session.external(
-            f"{mass.webserver.base_url}{base_path}index.html",
+            f"{auth_base_url}{base_path}index.html",
             step_id="auth",
             expires_in=MUSICKIT_FLOW_TIMEOUT,
         )

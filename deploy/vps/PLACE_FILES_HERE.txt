@@ -1,0 +1,3 @@
+Place Apple Music's client_id.bin and private_key.pem in /opt/ma/widevine_cdm
+on the VPS. The Compose overlay mounts that directory read-only into the
+music-assistant container. Restart the container after adding the files.
