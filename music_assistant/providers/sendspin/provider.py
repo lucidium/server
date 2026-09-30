@@ -45,7 +45,7 @@ from aiosendspin.server import (
     SendspinEvent,
     SendspinServer,
 )
-from aiosendspin.server.roles.registry import role_requires_pairing
+from aiosendspin.server.roles.registry import register_role, role_requires_pairing
 from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
@@ -111,6 +111,7 @@ from music_assistant.providers.sendspin.player import (
     SendspinSourcePlayer,
     SendspinVisualizerPlayer,
 )
+from music_assistant.providers.sendspin.pull_role import PULL_ROLE_ID, PullRole
 from music_assistant.providers.sendspin.security import (
     IDENTITY_FILENAME,
     get_or_create_server_identity,
@@ -461,6 +462,7 @@ class SendspinProvider(PlayerProvider):
         if orphaned:
             self.logger.info("Removed %d pairing(s) of a deleted or disabled account", orphaned)
         allow_legacy_clients = cast("bool", self.config.get_value(CONF_ALLOW_LEGACY_CLIENTS, True))
+        register_role(PULL_ROLE_ID, lambda client: PullRole(client, self))
         self.server_api = SendspinServer(
             self.mass.loop,
             identity,

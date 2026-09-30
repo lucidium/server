@@ -14,11 +14,13 @@ from aiosendspin.models.types import AudioCodec as SendspinAudioCodec
 from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
 from aiosendspin.server.push_stream import MAIN_CHANNEL, PushStream, StreamStoppedError
 from aiosendspin.server.roles.player.v1 import PlayerV1Role
-from music_assistant_models.enums import ContentType, MediaType
+from music_assistant_models.enums import ContentType, MediaType, PlayerFeature
 from music_assistant_models.media_items.audio_format import AudioFormat
 
 from music_assistant.constants import CONF_OUTPUT_CHANNELS
+from music_assistant.controllers.streams.audio import overlay_active
 from music_assistant.controllers.streams.audio_processing import get_media_session_id
+from music_assistant.controllers.streams.constants import PULL_SOURCE_DOMAINS
 from music_assistant.helpers.audio import iter_pcm_slices
 from music_assistant.helpers.ffmpeg import FFMpeg
 from music_assistant.helpers.util import import_module_in_thread
@@ -28,6 +30,13 @@ from music_assistant.providers.sendspin.bridge_role import (
     BRIDGE_CHANNELS,
     BRIDGE_SAMPLE_RATE,
     BridgePlayerRole,
+)
+from music_assistant.providers.sendspin.pull_role import (
+    PULL_ROLE_ID,
+    PullControlMessage,
+    PullControlPayload,
+    PullPlayMessage,
+    PullPlayPayload,
 )
 
 if TYPE_CHECKING:
@@ -359,6 +368,7 @@ class SendspinPlaybackSession:
         self._sendspin_pcm_format: SendspinAudioFormat = _DEFAULT_SENDSPIN_PCM_FORMAT
         self._queue_id: str | None = None
         self._queue_session_id: str | None = None
+        self._pull_item_id: str | None = None
 
     def flow_track_anchor_us(self, track_start_offset_us: int) -> int | None:
         """
@@ -412,6 +422,10 @@ class SendspinPlaybackSession:
             mishandle stream/clear.
         """
         task = self.playback_task
+        if getattr(self, "_pull_item_id", None) is not None:
+            self.player.api.send_message(PullControlMessage(PullControlPayload("stop")))
+            self._pull_item_id = None
+            self.player._attr_supported_features.discard(PlayerFeature.PAUSE)
         if task is None:
             return
         if task.done():
@@ -440,8 +454,20 @@ class SendspinPlaybackSession:
                 raise RuntimeError("playback already active")
             await self.cancel("restart requested", keep_stream=True)
         self._cancel_requested = False
-        self.playback_task = asyncio.create_task(self._run_playback(media))
+        use_pull = self._use_pull_transport(media)
+        self._pull_item_id = media.queue_item_id if use_pull else None
+        if use_pull:
+            self.player._attr_supported_features.add(PlayerFeature.PAUSE)
+        else:
+            self.player._attr_supported_features.discard(PlayerFeature.PAUSE)
+        run = self._run_pull_playback(media) if use_pull else self._run_playback(media)
+        self.playback_task = asyncio.create_task(run)
         self._attach_task_exception_logger(self.playback_task, "playback")
+
+    @property
+    def pull_item_id(self) -> str | None:
+        """Return the item currently handed to the pull client, if any."""
+        return self._pull_item_id
 
     async def close(self) -> None:
         """Stop playback and release all managed resources."""
@@ -735,6 +761,48 @@ class SendspinPlaybackSession:
         await self._close_member_ffmpeg(pipeline.processor)
 
     # -- Playback pipeline -----------------------------------------------------
+
+    async def _run_pull_playback(self, media: PlayerMedia) -> None:
+        """Hand one FLAC item to the client and retain its session until superseded."""
+        assert media.source_id is not None
+        assert media.queue_item_id is not None
+        queue_item = self.player.mass.player_queues.get_item(media.source_id, media.queue_item_id)
+        assert queue_item is not None
+        assert queue_item.streamdetails is not None
+        url, token = self.player.mass.streams.resolve_pull_stream_url(self.player.player_id, media)
+        self.player.api.send_message(
+            PullPlayMessage(
+                PullPlayPayload(
+                    url=url,
+                    token=token,
+                    item_id=media.queue_item_id,
+                    queue_id=media.source_id,
+                    start_position_ms=int(queue_item.streamdetails.seek_position * 1000),
+                    duration_ms=int(queue_item.duration * 1000) if queue_item.duration else None,
+                )
+            )
+        )
+        await asyncio.Event().wait()
+
+    def _use_pull_transport(self, media: PlayerMedia) -> bool:
+        """Select pull only for a single capable player and an approved resolved source."""
+        if (
+            self.player.api.role(PULL_ROLE_ID) is None
+            or self.player.synced_to is not None
+            or len(self.player.api.group.clients) != 1
+            or media.media_type != MediaType.TRACK
+            or not media.source_id
+            or not media.queue_item_id
+        ):
+            return False
+        queue = self.player.mass.player_queues.get(media.source_id)
+        if queue is None or queue.crossfade_enabled or overlay_active(queue):
+            return False
+        item = self.player.mass.player_queues.get_item(media.source_id, media.queue_item_id)
+        if item is None or item.streamdetails is None or item.streamdetails.is_realtime:
+            return False
+        provider = self.player.mass.get_provider(item.streamdetails.provider)
+        return provider is not None and provider.domain in PULL_SOURCE_DOMAINS
 
     async def _run_playback(self, media: PlayerMedia) -> None:  # noqa: PLR0915
         """

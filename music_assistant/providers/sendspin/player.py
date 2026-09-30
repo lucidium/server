@@ -120,6 +120,7 @@ from .helpers import (
     pin_code_format,
 )
 from .playback import SendspinPlaybackSession
+from .pull_role import PullControlMessage, PullControlPayload
 
 # Supported group commands for Sendspin players
 SUPPORTED_GROUP_COMMANDS = [
@@ -1230,6 +1231,7 @@ class SendspinPlayer(SendspinBasePlayer):
         self._attr_can_group_with = {provider.instance_id}
         hello_payload = initial_hello or self.api.info
         self.playback_session = SendspinPlaybackSession(self)
+        self._pull_terminal_item_id: str | None = None
         self._attr_supported_features = {
             PlayerFeature.PLAY_MEDIA,
             PlayerFeature.SET_MEMBERS,
@@ -1441,6 +1443,24 @@ class SendspinPlayer(SendspinBasePlayer):
             # notify again; bridges already torn down ignore it.
             self._notify_bridges_explicit_stop(self.api.group.clients)
 
+    async def play(self) -> None:
+        """Resume a paused progressive item."""
+        if self.playback_session.pull_item_id is None:
+            raise PlayerCommandFailed("No paused progressive item to resume")
+        self.api.send_message(PullControlMessage(PullControlPayload("resume")))
+        self._attr_playback_state = PlaybackState.PLAYING
+        self._attr_elapsed_time_last_updated = time.time()
+        self.update_state()
+
+    async def pause(self) -> None:
+        """Pause a progressive item without discarding its client buffer."""
+        if self.playback_session.pull_item_id is None:
+            raise PlayerCommandFailed("No progressive item to pause")
+        self.api.send_message(PullControlMessage(PullControlPayload("pause")))
+        self._attr_playback_state = PlaybackState.PAUSED
+        self._attr_elapsed_time_last_updated = time.time()
+        self.update_state()
+
     async def play_media(self, media: PlayerMedia) -> None:
         """Play media command."""
         self.logger.debug(
@@ -1448,6 +1468,7 @@ class SendspinPlayer(SendspinBasePlayer):
         )
 
         self._attr_current_media = media
+        self._pull_terminal_item_id = None
         self._attr_elapsed_time = None
         self._attr_elapsed_time_last_updated = None
 
@@ -1484,6 +1505,27 @@ class SendspinPlayer(SendspinBasePlayer):
                     translation_args=[self.display_name],
                 ) from None
             raise
+
+    def on_pull_progress(self, item_id: str, position_ms: int, status: int) -> None:
+        """Accept an item-scoped position report from the negotiated pull role."""
+        if item_id != self.playback_session.pull_item_id or status not in (0, 1, 2, 3, 4):
+            return
+        self._attr_elapsed_time = position_ms / 1000
+        self._attr_elapsed_time_last_updated = time.time()
+        if status == 1:
+            self._attr_playback_state = PlaybackState.PLAYING
+        elif status == 2:
+            self._attr_playback_state = PlaybackState.PAUSED
+        elif status in (3, 4):
+            self._attr_playback_state = PlaybackState.IDLE
+        self.update_state()
+        if status in (3, 4) and self._pull_terminal_item_id != item_id:
+            self._pull_terminal_item_id = item_id
+            if status == 3:
+                self.mass.create_task(self.mass.player_queues.next(self.player_id))
+            else:
+                self.logger.warning("Progressive playback failed for queue item %s", item_id)
+                self.mass.create_task(self.mass.player_queues.stop(self.player_id))
 
     async def on_config_updated(self) -> None:
         """Handle logic when the PlayerConfig is first loaded or updated."""
