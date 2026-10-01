@@ -71,6 +71,14 @@ class PullRole(Role):
         """Return the extension role family."""
         return "pull"
 
+    def on_connect(self) -> None:
+        """Attach the role to its group coordinator, if present."""
+        self._subscribe_to_group_role()
+
+    def on_disconnect(self) -> None:
+        """Detach the role from its group coordinator, if present."""
+        self._unsubscribe_from_group_role()
+
     def handles_inbound_binary(self, message_type: int) -> bool:
         """Accept only pull position reports."""
         return message_type == PULL_PROGRESS_BINARY_TYPE
