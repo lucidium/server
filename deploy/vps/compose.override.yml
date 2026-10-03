@@ -2,10 +2,14 @@ services:
   music-assistant:
     image: ma-server:${MA_IMAGE_TAG:-local}
     pull_policy: never
+    env_file:
+      - path: /opt/ma/secrets/deezer.env
+        required: false
     volumes:
       - /opt/ma/widevine_cdm:/usr/local/bin/widevine_cdm:ro
     environment:
       MA_PULL_PUBLIC_BASE_URL: ${MA_PULL_PUBLIC_BASE_URL:-https://music.liandry.org/streamserver/pull}
+      MASS_APP_VAR_THEAUDIODB_API_KEY: "123"
     build:
       context: ${MA_SERVER_SOURCE_DIR:-/opt/ma/server}
       dockerfile: Dockerfile

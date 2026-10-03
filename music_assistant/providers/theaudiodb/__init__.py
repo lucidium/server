@@ -148,7 +148,7 @@ class AudioDbMetadataProvider(MetadataProvider):
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self.cache = self.mass.cache
-        self.throttler = Throttler(rate_limit=1, period=1)
+        self.throttler = Throttler(rate_limit=1, period=2.5)
 
     async def get_artist_metadata(self, artist: Artist) -> MediaItemMetadata | None:
         """Retrieve metadata for artist on theaudiodb."""

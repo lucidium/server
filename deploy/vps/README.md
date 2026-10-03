@@ -34,6 +34,18 @@ Set `MA_PULL_PUBLIC_BASE_URL` if the public origin or proxy prefix differs from
 forwards that path unchanged to port 8097, where this fork registers the pull
 route. No provider CDN URL is sent to the app.
 
+Deezer encrypted tracks require an authorized 16-character decryption secret.
+The optional `/opt/ma/secrets/deezer.env` file supplies it to the container as
+`MASS_APP_VAR_DEEZER_DECRYPT_KEY`. Keep the directory private and the file readable
+only by root (mode `0600`); do not put the key in this checkout or a Compose
+command line. Without the file, the server still starts, but Deezer tracks cannot
+play. After provisioning or changing the file, recreate the music-assistant
+container so it receives the updated environment.
+
+The Audio DB uses the public free v1 API key `123` in the Compose environment.
+Its requests are paced at one every 2.5 seconds (at most 24 per minute), below
+the free tier's 30-per-minute limit.
+
 After reviewing the image and merged Compose configuration, redeploy with:
 
 ```sh
