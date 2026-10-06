@@ -18,9 +18,10 @@ services:
         BUILD_COMMIT: ${MA_BUILD_COMMIT:-unknown}
         BASE_IMAGE_VERSION: ${MA_BASE_IMAGE_VERSION:-latest}
   sing-box:
+    healthcheck:
+      test: ["CMD", "sing-box", "check", "-c", "/etc/sing-box/config.json"]
     ports: !override
       - "80:80"
       - "443:443"
       - "127.0.0.1:8095:8095"
       - "127.0.0.1:8097:8097"
-      - "127.0.0.1:9090:9090"
