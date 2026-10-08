@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import random
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import TYPE_CHECKING, Any, Concatenate, Protocol, TypedDict, TypeGuard, TypeVar
 
@@ -11,6 +12,7 @@ from music_assistant_models.media_items import MediaItemMetadata, Playlist, Radi
 from music_assistant_models.queue_item import QueueItem
 
 from music_assistant.constants import ATTR_PLAY_ACTION_IN_PROGRESS, PlaylistPlayableItem
+from music_assistant.helpers.playback_trace import trace_event, trace_stage
 
 if TYPE_CHECKING:
     from music_assistant_models.enums import ContentType, PlaybackState
@@ -86,32 +88,39 @@ def handle_play_action[PlayActionHostT: _PlayActionHost, **P, R](
         """Execute function with playback lock and play action flag set."""
         queue_id = kwargs.get("queue_id") or args[0]
         assert isinstance(queue_id, str)  # for type checking
-        queue_data = self._queue_data.get(queue_id)
-        if queue_data is None:
-            return await func(self, *args, **kwargs)
-        queue = queue_data.queue
-        # a play action on the queue of a player captured by a (sync)group releases the
-        # player from it first, which takes the group's lock - so that one is taken before
-        # the player's own (see PlayerController.get_group_and_player_lock)
-        async with self.mass.players.get_group_and_player_lock(queue_id):
-            prev_in_progress = queue.extra_attributes.get(ATTR_PLAY_ACTION_IN_PROGRESS, False)
-            try:
-                queue_data.play_action_refcount += 1
-                queue.extra_attributes[ATTR_PLAY_ACTION_IN_PROGRESS] = True
-                if not prev_in_progress:
-                    self.signal_update(queue_id)
+        with trace_stage("queue." + func.__name__, queue_id=queue_id):
+            queue_data = self._queue_data.get(queue_id)
+            if queue_data is None:
                 return await func(self, *args, **kwargs)
-            finally:
-                queue_data.play_action_refcount -= 1
-                if queue_data.play_action_refcount <= 0:
-                    queue_data.play_action_refcount = 0
-                    queue.extra_attributes[ATTR_PLAY_ACTION_IN_PROGRESS] = False
-                    # the queue follows the player through a debounced update, which is also
-                    # suppressed while an action is transitioning; recalculate it here so the
-                    # update that clears the flag already carries the action's resulting state
-                    if (player := self.mass.players.get_player(queue_id)) is not None:
-                        self.on_player_update(player, {})
-                    self.signal_update(queue_id)
+            queue = queue_data.queue
+            # a play action on the queue of a player captured by a (sync)group releases the
+            # player from it first, which takes the group's lock - so that one is taken before
+            # the player's own (see PlayerController.get_group_and_player_lock)
+            lock_started = time.monotonic()
+            async with self.mass.players.get_group_and_player_lock(queue_id):
+                trace_event(
+                    "queue.lock_acquired",
+                    queue_id=queue_id,
+                    wait_ms=round((time.monotonic() - lock_started) * 1000, 1),
+                )
+                prev_in_progress = queue.extra_attributes.get(ATTR_PLAY_ACTION_IN_PROGRESS, False)
+                try:
+                    queue_data.play_action_refcount += 1
+                    queue.extra_attributes[ATTR_PLAY_ACTION_IN_PROGRESS] = True
+                    if not prev_in_progress:
+                        self.signal_update(queue_id)
+                    return await func(self, *args, **kwargs)
+                finally:
+                    queue_data.play_action_refcount -= 1
+                    if queue_data.play_action_refcount <= 0:
+                        queue_data.play_action_refcount = 0
+                        queue.extra_attributes[ATTR_PLAY_ACTION_IN_PROGRESS] = False
+                        # the queue follows the player through a debounced update, which is also
+                        # suppressed while an action is transitioning; recalculate it here so the
+                        # update that clears the flag already carries the action's resulting state
+                        if (player := self.mass.players.get_player(queue_id)) is not None:
+                            self.on_player_update(player, {})
+                        self.signal_update(queue_id)
 
     return wrapper
 

@@ -23,6 +23,7 @@ from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.helpers.app_vars import app_var
 from music_assistant.helpers.datetime import utc_timestamp
+from music_assistant.helpers.playback_trace import trace_event, trace_url
 
 from .constants import DECRYPT_KEY_ERROR, DECRYPT_KEY_LENGTH
 from .gw_client import DeezerGWError
@@ -338,7 +339,18 @@ class DeezerStreamingManager:
                 raise MediaNotFoundError(
                     f"Failed to stream track {streamdetails.item_id}: HTTP {resp.status}"
                 )
+            first_chunk = True
             async for chunk in resp.content.iter_chunked(2048):
+                if first_chunk:
+                    first_chunk = False
+                    trace_event(
+                        "deezer.first_bytes",
+                        queue_id=streamdetails.queue_id,
+                        provider=streamdetails.provider,
+                        url=trace_url(str(resp.url)),
+                        status=resp.status,
+                        chunk_bytes=len(chunk),
+                    )
                 buffer += chunk
                 if len(buffer) >= 2048:
                     if chunk_index >= skip_chunks or chunk_index == 0:

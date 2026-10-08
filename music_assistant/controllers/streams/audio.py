@@ -143,6 +143,7 @@ from music_assistant.helpers.ffmpeg import (
     get_ffmpeg_stream,
 )
 from music_assistant.helpers.named_pipe import read_named_pipe
+from music_assistant.helpers.playback_trace import trace_event, trace_stage, trace_url
 from music_assistant.helpers.playlists import (
     HLS_CONTENT_TYPES,
     PLAYLIST_CONTENT_TYPES,
@@ -784,7 +785,15 @@ class StreamsAudio:
         if (buffer_lock := self._audio_buffer_locks.get(lock_key)) is None:
             buffer_lock = asyncio.Lock()
             self._audio_buffer_locks[lock_key] = buffer_lock
+        lock_started = time.monotonic()
         async with buffer_lock:
+            trace_event(
+                "buffer.lock_acquired",
+                queue_id=queue_item.queue_id,
+                item_id=queue_item.queue_item_id,
+                reason=reason,
+                wait_ms=round((time.monotonic() - lock_started) * 1000, 1),
+            )
             return await self._get_audio_buffer(
                 queue_item, seek_position_ms, reason, capacity_wait_timeout, allow_provider_match
             )
@@ -829,7 +838,17 @@ class StreamsAudio:
             if isinstance(provider, MusicProvider)
             else nullcontext()
         )
+        slot_started = time.monotonic()
+        trace_event(
+            "source.slot_wait", queue_id=streamdetails.queue_id, provider=streamdetails.provider
+        )
         async with stream_slot, aclosing(media_stream):
+            trace_event(
+                "source.slot_acquired",
+                queue_id=streamdetails.queue_id,
+                provider=streamdetails.provider,
+                wait_ms=round((time.monotonic() - slot_started) * 1000, 1),
+            )
             async for chunk in media_stream:
                 yield chunk
 
@@ -3795,7 +3814,17 @@ class StreamsAudio:
             token = BYPASS_THROTTLER.set(True)
             try:
                 stream_prov = cast("MusicProvider | PluginProvider", provider)
-                return await stream_prov.get_stream_details(mapping.item_id, media_type)
+                with trace_stage(
+                    "provider.resolve", provider=provider.instance_id, domain=provider.domain
+                ):
+                    details = await stream_prov.get_stream_details(mapping.item_id, media_type)
+                trace_event(
+                    "provider.selected",
+                    provider=details.provider,
+                    stream_type=details.stream_type.value,
+                    url=trace_url(details.path) if isinstance(details.path, str) else None,
+                )
+                return details
             except AudioError as err:
                 # remember the last one so its (actionable) message can be re-raised
                 last_audio_error = err
@@ -3949,6 +3978,15 @@ class StreamsAudio:
                     streamdetails.stream_type,
                 )
             stream_start = mass.loop.time()
+            trace_event(
+                "source.decoder_started",
+                queue_id=streamdetails.queue_id,
+                provider=streamdetails.provider,
+                pid=ffmpeg_proc.proc.pid,
+                stream_type=streamdetails.stream_type.value,
+                url=trace_url(audio_source) if isinstance(audio_source, str) else "<pipe>",
+                seek_seconds=requested_seek_position,
+            )
             chunk_size = calculate_content_length(pcm_format, chunk_seconds)
             chunk_iter = ffmpeg_proc.iter_chunked(chunk_size)
             while True:
@@ -3970,6 +4008,14 @@ class StreamsAudio:
                     # ffmpeg_input_format, so sample_rate / bit_depth / bit_rate
                     # parsed from the ffmpeg log already live on streamdetails too.
                     first_chunk_received = True
+                    trace_event(
+                        "source.first_pcm",
+                        queue_id=streamdetails.queue_id,
+                        provider=streamdetails.provider,
+                        pid=ffmpeg_proc.proc.pid,
+                        duration_ms=round((mass.loop.time() - stream_start) * 1000, 1),
+                        chunk_bytes=len(chunk),
+                    )
                     # Skip the codec_type writeback when the provider declared a
                     # decoded format: audio_format already holds the authoritative
                     # source codec and the probed value would just be the
@@ -4011,6 +4057,14 @@ class StreamsAudio:
                 raise AudioError("No audio was received")
             finished = True
         except (Exception, GeneratorExit, asyncio.CancelledError) as err:
+            trace_event(
+                "source.error",
+                queue_id=streamdetails.queue_id,
+                provider=streamdetails.provider,
+                error_type=type(err).__name__,
+                first_pcm=first_chunk_received,
+                bytes_sent=bytes_sent,
+            )
             if isinstance(err, asyncio.CancelledError | GeneratorExit):
                 # we were cancelled, just raise
                 cancelled = True

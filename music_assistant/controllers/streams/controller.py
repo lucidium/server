@@ -119,6 +119,7 @@ from music_assistant.helpers.ffmpeg import (
     get_ffmpeg_stream,
 )
 from music_assistant.helpers.ffmpeg import LOGGER as FFMPEG_LOGGER
+from music_assistant.helpers.playback_trace import trace_event
 from music_assistant.helpers.util import (
     format_ip_for_url,
     get_ip_addresses,
@@ -518,6 +519,7 @@ class StreamsController(CoreController):
         """Async initialize of module."""
         # initialize the audio sub-controller (needs mass.streams to be set)
         self.audio.setup()
+        trace_event("enabled", version=1)
         self._audio_analysis.setup()
         # copy log level to audio/ffmpeg loggers
         self.audio.logger.setLevel(self.logger.level)
@@ -720,6 +722,7 @@ class StreamsController(CoreController):
 
     async def serve_queue_item_stream(self, request: web.Request) -> web.StreamResponse:  # noqa: PLR0915
         """Stream single queueitem audio to a player."""
+        request_started = time.monotonic()
         self._log_request(request)
         queue_id = request.match_info["queue_id"]
         player_id = request.match_info["player_id"]
@@ -750,6 +753,13 @@ class StreamsController(CoreController):
                 or provider.domain not in PULL_SOURCE_DOMAINS
             ):
                 raise web.HTTPForbidden(reason="Pull playback is unavailable for this source")
+        trace_event(
+            "stream.request",
+            queue_id=queue_id,
+            item_id=queue_item_id,
+            player_id=player_id,
+            pull=pull_request,
+        )
         # the player may be asking for a track out of a stale cached copy of the queue
         # (its refresh signal can get lost): refusing it makes the player re-read the
         # queue, where serving it would silently play a track the user moved away
@@ -1067,6 +1077,17 @@ class StreamsController(CoreController):
                             bytes_sent += len(chunk)
                             if not first_chunk_received:
                                 first_chunk_received = True
+                                trace_event(
+                                    "stream.first_bytes",
+                                    queue_id=queue_id,
+                                    item_id=queue_item_id,
+                                    player_id=player_id,
+                                    duration_ms=round(
+                                        (time.monotonic() - request_started) * 1000, 1
+                                    ),
+                                    chunk_bytes=len(chunk),
+                                    pull=pull_request,
+                                )
                                 # inform the queue that the track is now loaded in the buffer
                                 # so for example the next track can be enqueued
                                 self.mass.player_queues.track_loaded_in_buffer(

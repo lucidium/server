@@ -12,8 +12,9 @@ requests retain their pacing, and the pull endpoint does not expose provider URL
 or persist audio.
 
 Place this checkout at `/opt/ma/server`, or set `MA_SERVER_SOURCE_DIR` to its
-absolute path. Build the wheel expected by the root Dockerfile and validate
-the merged configuration:
+absolute path. Configure the shared DNS path described below before using the
+overlay. Build the wheel expected by the root Dockerfile and validate the merged
+configuration:
 
 ```sh
 cd /opt/ma/server
@@ -79,3 +80,68 @@ The server can be deployed before the updated mobile app: clients without the
 negotiated `pull@v1` role continue on Sendspin push. The original handoff is in
 `HANDOFF_SENDEPIN_HYBRID.md`; verified deviations are recorded in
 `HANDOFF_SENDEPIN_HYBRID_REVIEW.md`.
+
+## Shared container DNS
+
+Music Assistant and nginx join sing-box's network namespace and inherit its
+Docker resolver configuration. Without an explicit `dns` setting on sing-box,
+Docker's `127.0.0.11` resolver forwards queries through the host's nameservers,
+outside the container's TUN. The overlay sets the sole upstream to `127.0.0.1`,
+which Docker contacts inside the shared namespace. Keep Docker's embedded
+resolver so container names still resolve. Do not add `dns` to the services
+using `network_mode: service:sing-box`; Docker does not support that combination.
+
+Before applying the overlay, back up `/opt/ma/sing-box/config.json` and add this
+entry to its `inbounds` array (TCP and UDP are both enabled when `network` is
+omitted):
+
+```json
+{
+  "type": "direct",
+  "tag": "dns-in",
+  "listen": "127.0.0.1",
+  "listen_port": 53
+}
+```
+
+Add these rules at the start of `route.rules`, ahead of music outbound routing:
+
+```json
+[
+  {"inbound": "dns-in", "action": "hijack-dns"},
+  {"port": 53, "action": "hijack-dns"}
+]
+```
+
+Keep the existing sniff rule and place the existing `protocol: dns` hijack rule
+immediately after it, before the music outbound rule. This also captures clients
+that send ordinary DNS directly to another resolver through the TUN.
+The loopback listener is internal; do not publish port 53 on the host.
+
+Retain the existing DNS upstream policy: music domains use the proxy DNS server,
+and other domains and the proxy hostname use the direct encrypted DNS server.
+The bootstrap resolver must have a literal IP address and must not depend on
+the loopback listener or proxy, otherwise proxy startup can deadlock. A direct
+encrypted lookup made by sing-box under this policy is intentional.
+
+Validate with `docker exec music-sing-box sing-box check -c
+/etc/sing-box/config.json` after writing the configuration. The overlay's live
+DNS healthcheck requires the image's BusyBox `nslookup` command and gates startup
+of Music Assistant and nginx on a working listener and upstream. Recreate all
+three containers together so they join the new network namespace:
+
+```sh
+cd /opt/ma
+docker compose -f docker-compose.yml -f server/deploy/vps/compose.override.yml config --quiet
+docker compose -f docker-compose.yml -f server/deploy/vps/compose.override.yml up -d --force-recreate --no-build --pull never --wait --wait-timeout 180
+docker exec music-assistant cat /etc/resolv.conf
+docker exec music-sing-box nslookup -type=A pipe.deezer.com
+docker exec music-sing-box nslookup -type=A api.music.apple.com
+```
+
+The resolver file should retain `nameserver 127.0.0.11` and show only
+`ExtServers: [127.0.0.1]`, without `host(...)` upstreams. Confirm provider lookups
+with a DNS capture on the VPS uplink: no plaintext provider queries should leave
+on port 53. To roll back, restore both the sing-box configuration and the Compose
+overlay from their backups, then run the same recreation command. Preserve any
+deployment-specific secrets files and the current `MA_IMAGE_TAG` in `/opt/ma/.env`.

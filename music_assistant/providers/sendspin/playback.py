@@ -23,6 +23,7 @@ from music_assistant.controllers.streams.audio_processing import get_media_sessi
 from music_assistant.controllers.streams.constants import PULL_SOURCE_DOMAINS
 from music_assistant.helpers.audio import iter_pcm_slices
 from music_assistant.helpers.ffmpeg import FFMpeg
+from music_assistant.helpers.playback_trace import trace_event
 from music_assistant.helpers.util import import_module_in_thread
 from music_assistant.models.player import PlayerMedia
 from music_assistant.providers.sendspin.bridge_role import (
@@ -769,6 +770,12 @@ class SendspinPlaybackSession:
         queue_item = self.player.mass.player_queues.get_item(media.source_id, media.queue_item_id)
         assert queue_item is not None
         assert queue_item.streamdetails is not None
+        trace_event(
+            "pull.handoff",
+            queue_id=media.source_id,
+            item_id=media.queue_item_id,
+            player_id=self.player.player_id,
+        )
         url, token = self.player.mass.streams.resolve_pull_stream_url(self.player.player_id, media)
         self.player.api.send_message(
             PullPlayMessage(

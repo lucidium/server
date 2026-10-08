@@ -20,6 +20,7 @@ from music_assistant_models.helpers import get_global_cache_value, set_global_ca
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 
 from .dsp import ComplexFilter, ComplexFilterInput
+from .playback_trace import TRACE_ENABLED, trace_event, trace_ffmpeg_line, trace_url
 from .process import AsyncProcess, check_output
 from .util import close_async_generator
 
@@ -108,6 +109,18 @@ class FFMpeg(AsyncProcess):
         loglevel: str = "info",
     ) -> None:
         """Initialize AsyncProcess."""
+        self._trace_http = (
+            TRACE_ENABLED
+            and isinstance(audio_input, str)
+            and audio_input.startswith(
+                ("http://", "https://", "data:application/vnd.apple.mpegurl;")
+            )
+        )
+        self._redact_log = self._trace_http or (
+            isinstance(audio_input, str)
+            and audio_input.startswith("data:application/vnd.apple.mpegurl;")
+        )
+        self._trace_events = 0
         ffmpeg_args = get_ffmpeg_args(
             input_format=input_format,
             output_format=output_format,
@@ -116,7 +129,7 @@ class FFMpeg(AsyncProcess):
             output_path=audio_output if isinstance(audio_output, str) else "-",
             extra_input_args=extra_input_args or [],
             extra_output_args=extra_output_args or [],
-            loglevel=loglevel,
+            loglevel="trace" if self._trace_http else loglevel,
         )
         self.audio_input = audio_input
         self.input_format = input_format
@@ -168,8 +181,10 @@ class FFMpeg(AsyncProcess):
         if self.proc:
             self.logger = LOGGER.getChild(str(self.proc.pid))
         clean_args = []
-        for arg in self._args[1:]:
-            if arg.startswith("http"):
+        for index, arg in enumerate(self._args[1:], start=1):
+            if self._args[index - 1] in ("-decryption_key", "-seg_format_options"):
+                clean_args.append("<REDACTED>")
+            elif arg.startswith("http"):
                 clean_args.append("<URL>")
             elif "/" in arg and "." in arg:
                 clean_args.append("<FILE>")
@@ -178,7 +193,14 @@ class FFMpeg(AsyncProcess):
             else:
                 clean_args.append(arg)
         args_str = " ".join(clean_args)
-        self.logger.log(VERBOSE_LOG_LEVEL, "started with args: %s", args_str)
+        if TRACE_ENABLED:
+            trace_event(
+                "ffmpeg.spawn",
+                pid=self.proc.pid if self.proc else None,
+                url=trace_url(self.audio_input) if isinstance(self.audio_input, str) else "<pipe>",
+            )
+        else:
+            self.logger.log(VERBOSE_LOG_LEVEL, "started with args: %s", args_str)
         self._stderr_reader_task = asyncio.create_task(self._log_reader_task())
         if isinstance(self.audio_input, AsyncGenerator):
             self._stdin_feeder_task = asyncio.create_task(self._feed_stdin())
@@ -200,13 +222,20 @@ class FFMpeg(AsyncProcess):
         decode_errors = 0
         decode_errors_reported = False
         async for line in self.iter_stderr():
-            if self.collect_log_history:
+            if self._trace_http and self._trace_events < 512:
+                self._trace_events += trace_ffmpeg_line(line, self.proc.pid if self.proc else None)
+                if self._trace_events == 512:
+                    trace_event("ffmpeg.trace_limit", pid=self.proc.pid if self.proc else None)
+            # Debug stderr and inline HLS manifests can contain signed URLs and keys.
+            # Only the allowlisted fields may be logged, even with tracing disabled
+            # for an inline manifest.
+            if self.collect_log_history and not self._redact_log:
                 self.log_history.append(line)
             # ffmpeg logging can be quite verbose, so we only log critical errors
             # unless verbose logging is enabled
-            if "critical" in line:
+            if "critical" in line and not self._redact_log:
                 self.logger.error(line)
-            elif self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
+            elif not self._redact_log and self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
                 self.logger.log(VERBOSE_LOG_LEVEL, line)
 
             if "Invalid data found when processing input" in line:
@@ -224,7 +253,9 @@ class FFMpeg(AsyncProcess):
                 self._abort_task = asyncio.create_task(self.close())
 
             # Log reconnection events for radio streams
-            if "Opening" in line or "Reconnect" in line or "reconnect" in line:
+            if not self._redact_log and (
+                "Opening" in line or "Reconnect" in line or "reconnect" in line
+            ):
                 self.logger.debug("FFmpeg: %s", line)
 
             if self._uses_concat_demuxer and "Error during demuxing" in line:
@@ -591,7 +622,8 @@ def get_ffmpeg_args(
             # raw PCM decoder declared above
             input_args += ["-acodec", input_format.codec_type.name.lower()]
 
-        # add input path at the end
+    # An explicit demuxer (-f) still needs its input unless the caller supplied one.
+    if "-i" not in extra_input_args:
         input_args += ["-i", input_path]
 
     # collect output args

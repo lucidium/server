@@ -74,6 +74,7 @@ from music_assistant_models.player import DeviceInfo
 from PIL import Image
 
 from music_assistant.controllers.streams.audio_analysis import SMART_FADES_ANALYSIS_DOMAIN
+from music_assistant.helpers.playback_trace import trace_event
 from music_assistant.helpers.util import is_valid_mac_address, join_task
 from music_assistant.models.player import AnnouncementFeature, Player, PlayerMedia
 from music_assistant.models.setup_flow import FINISH_STEP_SILENT, AbortFlow, StepExpiredError
@@ -1510,6 +1511,20 @@ class SendspinPlayer(SendspinBasePlayer):
         """Accept an item-scoped position report from the negotiated pull role."""
         if item_id != self.playback_session.pull_item_id or status not in (0, 1, 2, 3, 4):
             return
+        reported_state = {
+            1: PlaybackState.PLAYING,
+            2: PlaybackState.PAUSED,
+            3: PlaybackState.IDLE,
+            4: PlaybackState.IDLE,
+        }.get(status)
+        if reported_state is not None and reported_state != self._attr_playback_state:
+            trace_event(
+                "pull.state",
+                player_id=self.player_id,
+                item_id=item_id,
+                status=status,
+                position_ms=position_ms,
+            )
         self._attr_elapsed_time = position_ms / 1000
         self._attr_elapsed_time_last_updated = time.time()
         if status == 1:

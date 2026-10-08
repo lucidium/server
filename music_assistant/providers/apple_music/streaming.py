@@ -5,9 +5,12 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urljoin
 
 import aiofiles
+from aiohttp import ClientTimeout
 from aiohttp.client_exceptions import ClientError
 from music_assistant_models.enums import ContentType, StreamType
 from music_assistant_models.errors import MediaNotFoundError
@@ -17,8 +20,10 @@ from pywidevine import PSSH, Cdm, Device, DeviceTypes
 from pywidevine.license_protocol_pb2 import WidevinePsshData
 from shortuuid import uuid
 
+from music_assistant.helpers.aiohttp_client import encoded_request_url
+from music_assistant.helpers.ffmpeg import get_ffmpeg_hls_cmaf_input_args
 from music_assistant.helpers.json import json_loads
-from music_assistant.helpers.playlists import fetch_playlist
+from music_assistant.helpers.playlists import PLAYLIST_READ_TIMEOUT, parse_m3u, read_playlist_body
 
 from .constants import (
     CACHE_CATEGORY_DECRYPT_KEY,
@@ -93,12 +98,30 @@ class AppleMusicStreamingManager:
         if not stream_url or not uri:
             raise MediaNotFoundError("No stream URL found for song.")
         key_id = base64.b64decode(uri.split(",")[1])
+        decryption_key = await self._get_decryption_key(license_url, key_id, uri, item_id)
         return StreamDetails(
             item_id=item_id,
             provider=self.provider.instance_id,
             audio_format=AudioFormat(content_type=ContentType.MP4, codec_type=ContentType.AAC),
-            stream_type=StreamType.ENCRYPTED_HTTP,
-            decryption_key=await self._get_decryption_key(license_url, key_id, uri, item_id),
+            # Keep the HLS byte-range index for both startup and seeking. StreamType.HLS
+            # would pass through the generic substream resolver and discard that index.
+            stream_type=StreamType.HTTP,
+            extra_input_args=[
+                "-f",
+                "hls",
+                "-seg_format_options",
+                f"decryption_key={decryption_key}",
+                # Fetch each declared range separately: FFmpeg 9 range reuse can
+                # consume later fragments without decoding them. HLS still seeks
+                # through the playlist index with explicit HTTP byte ranges.
+                "-http_multiple",
+                "0",
+                "-http_seekable",
+                "0",
+                "-http_persistent",
+                "0",
+                *get_ffmpeg_hls_cmaf_input_args(),
+            ],
             path=stream_url,
             can_seek=True,
             allow_seek=True,
@@ -138,19 +161,41 @@ class AppleMusicStreamingManager:
     async def _parse_stream_url_and_uri(
         self, stream_assets: list[dict[str, Any]]
     ) -> tuple[str | None, str | None]:
-        """Parse the stream URL and key URI from the song assets."""
+        """Return an in-memory HLS playlist and the account license key URI."""
         ctrp256_urls = [asset["URL"] for asset in stream_assets if asset["flavor"] == "28:ctrp256"]
         if not ctrp256_urls:
             raise MediaNotFoundError("No ctrp256 URL found for song.")
-        playlist_url = ctrp256_urls[0]
-        playlist_items = await fetch_playlist(
-            self.provider.mass, ctrp256_urls[0], raise_on_hls=False
+        async with self.provider.mass.http_session.get(
+            encoded_request_url(ctrp256_urls[0]),
+            timeout=ClientTimeout(total=PLAYLIST_READ_TIMEOUT),
+        ) as response:
+            response.raise_for_status()
+            playlist = (await read_playlist_body(response.content)).decode("utf-8")
+            playlist_url = str(response.url)
+        playlist_items = parse_m3u(playlist)
+        if not playlist_items:
+            raise MediaNotFoundError("Empty Apple Music stream playlist.")
+        # Resolve the license through the account as before, then give its key directly
+        # to the MP4 demuxer. FFmpeg must not fetch the playlist's DRM key URIs itself.
+        lines = []
+        for raw_line in playlist.splitlines():
+            line = raw_line.strip()
+            if line.startswith(("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:")):
+                continue
+            if line.startswith("#EXT-X-MAP:"):
+                line = re.sub(
+                    r'URI="([^"]+)"',
+                    lambda match: f'URI="{urljoin(playlist_url, match[1])}"',
+                    line,
+                )
+            elif line and not line.startswith("#"):
+                line = urljoin(playlist_url, line)
+            lines.append(line)
+        encoded_playlist = base64.b64encode(("\n".join(lines) + "\n").encode()).decode()
+        return (
+            f"data:application/vnd.apple.mpegurl;base64,{encoded_playlist}",
+            playlist_items[0].key,
         )
-        playlist_item = playlist_items[0]
-        base_path = playlist_url.rsplit("/", 1)[0]
-        track_url = base_path + "/" + playlist_items[0].path
-        key = playlist_item.key
-        return (track_url, key)
 
     @property
     def _decryption_headers(self) -> dict[str, str]:

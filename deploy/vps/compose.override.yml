@@ -18,8 +18,12 @@ services:
         BUILD_COMMIT: ${MA_BUILD_COMMIT:-unknown}
         BASE_IMAGE_VERSION: ${MA_BASE_IMAGE_VERSION:-latest}
   sing-box:
+    # Docker forwards external lookups inside this shared network namespace.
+    # The loopback listener must be configured in sing-box first; see README.md.
+    dns: !override
+      - "127.0.0.1"
     healthcheck:
-      test: ["CMD", "sing-box", "check", "-c", "/etc/sing-box/config.json"]
+      test: ["CMD-SHELL", "nslookup -type=A example.com 127.0.0.1 >/dev/null 2>&1"]
     ports: !override
       - "80:80"
       - "443:443"
