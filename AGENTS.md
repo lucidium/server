@@ -33,7 +33,9 @@ Fork exception approved by the owner on 2026-09-30: negotiated `pull@v1` clients
 unpaced, signed, item-scoped streams for local files, Apple Music, Deezer, Tidal, Qobuz, and
 SoundCloud. The default stream endpoints remain paced. This exception authorizes in-memory
 playback only; it does not authorize exporting or storing provider audio, exposing provider
-URLs, or bypassing provider account limits. See `HANDOFF_SENDEPIN_HYBRID_REVIEW.md`.
+URLs, or bypassing provider account limits. On 2026-10-10, the owner extended this
+exception to Yandex Music (`yandex_music`). See
+`debug/archive/02-handoff-sendspin-hybrid-review.md`.
 
 ## Development Commands
 

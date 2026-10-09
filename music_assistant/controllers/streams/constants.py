@@ -10,7 +10,7 @@ from music_assistant_models.enums import VolumeNormalizationMode
 from music_assistant.helpers.util import get_total_system_memory, meets_memory_target
 
 PULL_SOURCE_DOMAINS: Final[frozenset[str]] = frozenset(
-    {"filesystem_local", "apple_music", "deezer", "tidal", "qobuz", "soundcloud"}
+    {"filesystem_local", "apple_music", "deezer", "tidal", "qobuz", "soundcloud", "yandex_music"}
 )
 
 # What the volume normalization preference falls back to.
